@@ -35,6 +35,14 @@ static bool mt7921_disable_aspm;
 module_param_named(disable_aspm, mt7921_disable_aspm, bool, 0644);
 MODULE_PARM_DESC(disable_aspm, "disable PCI ASPM support");
 
+static bool mt7921e_full_pwr_suspend;
+module_param_named(full_pwr_suspend, mt7921e_full_pwr_suspend, bool, 0644);
+MODULE_PARM_DESC(full_pwr_suspend,
+		 "keep the chip at full power across suspend/resume "
+		 "(KeepFullPwr 1) instead of letting it enter deep sleep; "
+		 "avoids the rapid deep-sleep transit that can kill the "
+		 "firmware's WM thread after repeated suspend/resume cycles");
+
 static int mt7921e_init_reset(struct mt792x_dev *dev)
 {
 	return mt792x_wpdma_reset(dev, true);
@@ -58,9 +66,19 @@ static void mt7921e_unregister_device(struct mt792x_dev *dev)
 	cancel_work_sync(&dev->reset_work);
 
 	mt76_connac2_tx_token_put(&dev->mt76);
-	__mt792x_mcu_drv_pmctrl(dev);
-	mt792x_dma_cleanup(dev);
-	mt792x_wfsys_reset(dev);
+	if (READ_ONCE(dev->mcu_ownership.unrecoverable)) {
+		/*
+		 * The chip is hard-wedged: any MMIO access (drv_pmctrl,
+		 * dma_cleanup, wfsys_reset) can hang the CPU on the dead
+		 * PCIe link.  Skip the hardware teardown entirely and only
+		 * free the driver-side DMA ring memory.
+		 */
+		mt76_dma_cleanup(&dev->mt76);
+	} else {
+		__mt792x_mcu_drv_pmctrl(dev);
+		mt792x_dma_cleanup(dev);
+		mt792x_wfsys_reset(dev);
+	}
 	skb_queue_purge(&dev->mt76.mcu.res_q);
 
 	tasklet_disable(&dev->mt76.irq_tasklet);
@@ -471,6 +489,14 @@ static int mt7921_pci_suspend(struct device *device)
 	struct mt76_connac_pm *pm = &dev->pm;
 	int i, err;
 
+	if (READ_ONCE(dev->mcu_ownership.unrecoverable)) {
+		/* Chip is hard-wedged: touch no registers, let the system
+		 * suspend proceed without it.  On resume the poll/PM paths
+		 * are gated too, so this cannot wedge the machine.
+		 */
+		return 0;
+	}
+
 	pm->suspended = true;
 	cancel_delayed_work_sync(&dev->mcu_ownership.poll_work);
 	cancel_work_sync(&dev->reset_work);
@@ -494,10 +520,25 @@ static int mt7921_pci_suspend(struct device *device)
 	if (err)
 		goto restore_suspend;
 
-	/* always enable deep sleep during suspend to reduce
-	 * power consumption
+	/* Suspend the chip low-power state during D3: either let the
+	 * firmware enter deep sleep (KeepFullPwr 0) for battery savings,
+	 * or keep full power when mt7921e_full_pwr_suspend is set.  The
+	 * D3 deep-sleep transit across rapid suspend/resume cycles is the
+	 * suspected WM-thread killer, so full power is the safe A/B.
 	 */
-	mt76_connac_mcu_set_deep_sleep(&dev->mt76, true);
+	if (!mt7921e_full_pwr_suspend)
+		mt76_connac_mcu_set_deep_sleep(&dev->mt76, true);
+	else
+		mt76_connac_mcu_set_deep_sleep(&dev->mt76, false);
+
+	/* Let the firmware settle into deep sleep before we tear
+	 * down DMA and interrupts.  Rapid suspend/resume cycling
+	 * (sus_roam attack, repeated lid open/close) can leave the
+	 * firmware's WM thread in a transitional state when the
+	 * host yanks DMA too quickly after the deep-sleep command;
+	 * across enough cycles this becomes unrecoverable.
+	 */
+	msleep(200);
 
 	napi_disable(&mdev->tx_napi);
 	mt76_worker_disable(&mdev->tx_worker);
@@ -554,6 +595,14 @@ static int mt7921_pci_resume(struct device *device)
 	struct mt792x_dev *dev = container_of(mdev, struct mt792x_dev, mt76);
 	struct mt76_connac_pm *pm = &dev->pm;
 	int i, err;
+
+	if (READ_ONCE(dev->mcu_ownership.unrecoverable)) {
+		/* Chip is hard-wedged: touch no registers.  Return 0 so
+		 * the system resume can proceed; the poll/PM paths will
+		 * remain gated by the unrecoverable flag.
+		 */
+		return 0;
+	}
 
 	err = mt792x_mcu_drv_pmctrl(dev);
 	if (err < 0)
