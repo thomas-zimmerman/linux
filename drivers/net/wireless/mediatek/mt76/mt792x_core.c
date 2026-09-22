@@ -812,6 +812,9 @@ int mt792x_mcu_drv_pmctrl(struct mt792x_dev *dev)
 	struct mt76_connac_pm *pm = &dev->pm;
 	int err = 0;
 
+	if (READ_ONCE(dev->mcu_ownership.unrecoverable))
+		return -EIO;
+
 	mutex_lock(&pm->mutex);
 
 	if (!test_bit(MT76_STATE_PM, &mphy->state))
@@ -927,6 +930,9 @@ bool mt792x_mcu_is_alive(struct mt792x_dev *dev)
 	if (mt76_is_sdio(&dev->mt76) || mt76_is_usb(&dev->mt76))
 		return true;
 
+	if (READ_ONCE(dev->mcu_ownership.unrecoverable))
+		return false;
+
 	return !!(mt76_rr(dev, MT_CONN_ON_LPCTL) & PCIE_LPCR_HOST_OWN_SYNC);
 }
 EXPORT_SYMBOL_GPL(mt792x_mcu_is_alive);
@@ -952,6 +958,9 @@ int mt792x_mcu_ownership_acquire(struct mt792x_dev *dev)
 
 	if (!mt76_is_mmio(&dev->mt76))
 		return 0;
+
+	if (READ_ONCE(m_own->unrecoverable))
+		return -EIO;
 
 	mutex_lock(&m_own->lock);
 
@@ -990,6 +999,31 @@ void mt792x_mcu_ownership_release(struct mt792x_dev *dev)
 }
 EXPORT_SYMBOL_GPL(mt792x_mcu_ownership_release);
 
+/* Track failed recovery rounds; arm unrecoverable when threshold reached.
+ * Each call represents one full failed recovery episode (e.g. one
+ * mac_reset_work iteration that yielded nothing despite multiple retries).
+ * Once unrecoverable is set, all MMIO-touching paths bail out early to
+ * avoid hanging the CPU on a dead PCIe link.
+ */
+void mt792x_mcu_ownership_note_failed_reset(struct mt792x_dev *dev)
+{
+	struct mt792x_mcu_ownership *m_own = &dev->mcu_ownership;
+
+	mutex_lock(&m_own->lock);
+	m_own->consecutive_fails++;
+	if (m_own->consecutive_fails >= MT792x_OWN_GIVEUP_FAILS)
+		m_own->unrecoverable = true;
+	mutex_unlock(&m_own->lock);
+
+	if (READ_ONCE(m_own->unrecoverable)) {
+		if (cmpxchg(&m_own->gave_up_notice, false, true) == false)
+			dev_err(dev->mt76.dev,
+				"chip unrecoverable after %u failed recovery attempts; reload the driver or power-cycle to restore wi-fi\n",
+				m_own->consecutive_fails);
+	}
+}
+EXPORT_SYMBOL_GPL(mt792x_mcu_ownership_note_failed_reset);
+
 static void mt792x_mcu_ownership_poll(struct work_struct *work)
 {
 	struct mt792x_dev *dev = container_of((struct delayed_work *)work,
@@ -1001,6 +1035,10 @@ static void mt792x_mcu_ownership_poll(struct work_struct *work)
 
 	if (!mt76_is_mmio(&dev->mt76))
 		goto reschedule;
+
+	/* Teardown in progress (rmmod): stop re-arming, quiesce immediately. */
+	if (READ_ONCE(m_own->destroyed))
+		return;
 
 	/*
 	 * Read the owner state under lock, but release before the MMIO
@@ -1014,24 +1052,60 @@ static void mt792x_mcu_ownership_poll(struct work_struct *work)
 	current_owner = m_own->owner;
 	mutex_unlock(&m_own->lock);
 
-	if (current_owner == MCU_OWNER_NONE || current_owner == MCU_OWNER_DEAD)
-		goto reschedule;
+	if (current_owner == MCU_OWNER_NONE || current_owner == MCU_OWNER_DEAD) {
+		/*
+		 * A DEAD chip cannot revive on its own: only the wifisys
+		 * reset performed by the reset path when it finds ownership
+		 * DEAD can re-arm it.  There is no point busy-polling it at
+		 * the fast cadence; back off 10x while it stays DEAD.
+		 */
+		if (READ_ONCE(m_own->destroyed))
+			return;
+
+		queue_delayed_work(dev->mt76.wq, &m_own->poll_work,
+				   current_owner == MCU_OWNER_DEAD ?
+				   MT792x_OWN_POLL_INTERVAL * 10 :
+				   MT792x_OWN_POLL_INTERVAL);
+		return;
+	}
 
 	alive = mt792x_mcu_is_alive(dev);
 
 	if (!alive) {
 		mutex_lock(&m_own->lock);
-		if (m_own->owner == MCU_OWNER_WIFI) {
+		if (m_own->owner == MCU_OWNER_WIFI)
 			m_own->owner = MCU_OWNER_DEAD;
-			m_own->consecutive_fails++;
-		}
 		mutex_unlock(&m_own->lock);
+
+		if (READ_ONCE(m_own->destroyed))
+			return;
+
+		/*
+		 * Firmware is not answering.  Count this observation as a
+		 * failed recovery episode; once a handful of recovery rounds
+		 * have come up empty the chip is hard-wedged, every further
+		 * attempt would just ping a dead PCIe link (which can hang
+		 * the CPU) while holding MT76_RESET state.  Stop re-triggering
+		 * resets forever, tell userland what to do, and drop to a slow
+		 * re-check so a freak revival is still caught and the state
+		 * machine stays rmmod-safe.
+		 */
+		mt792x_mcu_ownership_note_failed_reset(dev);
+
+		if (READ_ONCE(m_own->unrecoverable)) {
+			queue_delayed_work(dev->mt76.wq, &m_own->poll_work,
+					   5 * 60 * HZ);
+			return;
+		}
+
 		dev_warn(dev->mt76.dev,
 			 "MCU alive check failed, triggering reset\n");
 		mt792x_reset(&dev->mt76);
 	}
 
 reschedule:
+	if (READ_ONCE(m_own->destroyed))
+		return;
 	queue_delayed_work(dev->mt76.wq, &m_own->poll_work,
 			   MT792x_OWN_POLL_INTERVAL);
 }
@@ -1050,7 +1124,17 @@ EXPORT_SYMBOL_GPL(mt792x_mcu_ownership_init);
 
 void mt792x_mcu_ownership_destroy(struct mt792x_dev *dev)
 {
-	cancel_delayed_work_sync(&dev->mcu_ownership.poll_work);
+	struct mt792x_mcu_ownership *m_own = &dev->mcu_ownership;
+
+	/*
+	 * Tear down the poll first: once destroyed is set the poll work will
+	 * not re-arm itself, so cancel_delayed_work_sync() can make it
+	 * quiesce.  Without this the in-flight poll re-queues itself after
+	 * the cancel returns, leaving a pending work on a device that is
+	 * about to be freed (use-after-free on the next timer tick).
+	 */
+	m_own->destroyed = true;
+	cancel_delayed_work_sync(&m_own->poll_work);
 }
 EXPORT_SYMBOL_GPL(mt792x_mcu_ownership_destroy);
 

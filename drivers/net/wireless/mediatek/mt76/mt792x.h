@@ -42,6 +42,7 @@
 #define MT792x_WFSYS_INIT_RETRY_COUNT	2
 
 #define MT792x_OWN_POLL_INTERVAL	msecs_to_jiffies(1000)
+#define MT792x_OWN_GIVEUP_FAILS	4
 
 #define MT7902_FIRMWARE_WM	"mediatek/WIFI_RAM_CODE_MT7902_1.bin"
 #define MT7920_FIRMWARE_WM	"mediatek/WIFI_RAM_CODE_MT7961_1a.bin"
@@ -231,11 +232,15 @@ struct mt792x_mcu_ownership {
 	struct mutex lock;
 	unsigned long last_acquire;
 	u32 consecutive_fails;
+	bool destroyed;
+	bool gave_up_notice;
+	bool unrecoverable;
 	struct delayed_work poll_work;
 };
 
 void mt792x_mcu_ownership_init(struct mt792x_dev *dev);
 void mt792x_mcu_ownership_destroy(struct mt792x_dev *dev);
+void mt792x_mcu_ownership_note_failed_reset(struct mt792x_dev *dev);
 int mt792x_mcu_ownership_acquire(struct mt792x_dev *dev);
 void mt792x_mcu_ownership_release(struct mt792x_dev *dev);
 bool mt792x_mcu_is_alive(struct mt792x_dev *dev);
