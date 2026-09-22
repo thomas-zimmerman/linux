@@ -60,11 +60,58 @@ int mt7921e_mac_reset(struct mt792x_dev *dev)
 	if (test_bit(MT76_REMOVED, &dev->mt76.phy.state))
 		return -ENODEV;
 
+	if (READ_ONCE(dev->mcu_ownership.unrecoverable))
+		return -EIO;
+
 	err = mt792x_mcu_ownership_acquire(dev);
 	if (err) {
-		dev_err(dev->mt76.dev,
-			"cannot acquire MCU ownership, aborting reset\n");
-		return err;
+		/*
+		 * A failed acquire on PCIe always leaves the MCU marked DEAD
+		 * (see mt792x_mcu_ownership_acquire).  A DEAD chip cannot
+		 * come back on its own: the ownership poll keeps re-arming
+		 * the reset path which then aborts here, so the link stays
+		 * dead until the machine is power-cycled.  Give it a genuine
+		 * in-place recovery instead: the same wifi-subsystem reset
+		 * (WFSYS_SW_RST_B toggle) the suspend path uses, then re-arm
+		 * ownership and retry the acquire so the full reset plus
+		 * firmware reload below can run.  Only attempt this a couple
+		 * of times per DEAD episode; a chip that survives a wifisys
+		 * reset still dead is unrecoverable without a power cycle.
+		 */
+		if (mt76_is_mmio(&dev->mt76) &&
+		    dev->mcu_ownership.owner == MCU_OWNER_DEAD &&
+		    dev->mcu_ownership.consecutive_fails < 3 &&
+		    !READ_ONCE(dev->mcu_ownership.unrecoverable)) {
+			dev_warn(dev->mt76.dev,
+				 "MCU ownership dead, attempting wifisys reset\n");
+			if (mt792x_wfsys_reset(dev)) {
+				dev_err(dev->mt76.dev,
+					"wifisys reset failed, chip needs a power cycle\n");
+				mutex_lock(&dev->mcu_ownership.lock);
+				dev->mcu_ownership.consecutive_fails++;
+				mutex_unlock(&dev->mcu_ownership.lock);
+			} else {
+				/*
+				 * The wifisys reset only restored MCU ownership;
+				 * the firmware is still dead until the full reset
+				 * path below completes.  Do NOT clear
+				 * consecutive_fails here, or the give-up counter
+				 * gets wiped every cycle while the chip stays
+				 * wedged (the counter is only reset when
+				 * mt792x_dev_reset() below returns success).
+				 */
+				mutex_lock(&dev->mcu_ownership.lock);
+				if (dev->mcu_ownership.owner == MCU_OWNER_DEAD)
+					dev->mcu_ownership.owner = MCU_OWNER_NONE;
+				mutex_unlock(&dev->mcu_ownership.lock);
+				err = mt792x_mcu_ownership_acquire(dev);
+			}
+		}
+		if (err) {
+			dev_err(dev->mt76.dev,
+				"cannot acquire MCU ownership, aborting reset\n");
+			return err;
+		}
 	}
 
 	mt76_connac_free_pending_tx_skbs(&dev->pm, NULL);
